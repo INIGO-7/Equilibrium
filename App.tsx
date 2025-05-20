@@ -14,9 +14,17 @@ type RootStackParamList = {
 };
 
 type Message = {
-  role: "user" | "assistant";
+  role: "system" | "user" | "assistant";
   content: string;
 };
+
+const INITIAL_CONVERSATION: Message[] = [
+  {
+    role: 'system',
+    content:
+      'This is a conversation between user and assistant, a friendly chatbot.',
+  },
+];
 
 const MODEL_FILE = 'dolphin-2.9.4-gemma2-2b-Q4_K_M.gguf'
 const MODEL_REPO = 'bartowski/dolphin-2.9.4-gemma2-2b-GGUF'
@@ -27,7 +35,7 @@ const MODEL_URL = `https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FIL
 function HomeScreen({ navigation }: any) {
   const [message, setMessage] = useState('');
 
-  const handleSend = () => {
+  const sendAndNavigate = () => {
     if (message.trim()) {
       navigation.navigate('Chat', { initialMessage: message });
       setMessage('');
@@ -65,9 +73,9 @@ function HomeScreen({ navigation }: any) {
             value={message}
             onChangeText={setMessage}
             multiline
-            onSubmitEditing={handleSend}
+            onSubmitEditing={sendAndNavigate}
           />
-          <TouchableOpacity style={styles.sendButton} onPress={handleSend}>
+          <TouchableOpacity style={styles.sendButton} onPress={sendAndNavigate}>
             <Text style={styles.buttonText}>→</Text>
           </TouchableOpacity>
         </View>
@@ -85,7 +93,7 @@ function OnboardingScreen({ navigation }: any) {
     setIsDownloading(true);
     try {
       const destPath = await downloadModel(
-        'mental-health-assistant.gguf',
+        MODEL_FILE,
         MODEL_URL,
         (progress) => setDownloadProgress(progress)
       );
@@ -124,7 +132,7 @@ function OnboardingScreen({ navigation }: any) {
           <View style={styles.progressContainer}>
             <ProgressBar progress={downloadProgress} />
             <Text style={styles.progressText}>
-              {Math.round(downloadProgress * 100)}% downloaded
+              {Math.round(downloadProgress)}% downloaded
             </Text>
           </View>
         ) : (
@@ -143,17 +151,95 @@ function OnboardingScreen({ navigation }: any) {
 
 // Chat Screen Component
 function ChatScreen({ route }: any) {
-  const [conversation, setConversation] = useState<Message[]>([
-    { role: "user", content: route.params.initialMessage },
-    { role: "assistant", content: "" }
-  ]);
+  const [conversation, setConversation] = 
+    useState<Message[]>(INITIAL_CONVERSATION);
   const [context, setContext] = useState<any>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const scrollViewRef = useRef<ScrollView>(null);
+  const [userInput, setUserInput] = useState<string>(route.params.initialMessage);
+
+  const handleSendMessage = async () => {
+    // Check if context is loaded and user input is valid
+    if (!context) {
+      Alert.alert('Model Not Loaded', 'Please load the model first.');
+      return;
+    }
+
+    if (!userInput.trim()) {
+      Alert.alert('Input Error', 'Please enter a message.');
+      return;
+    } 
+
+    const newConversation: Message[] = [
+      ...conversation,
+      {role: 'user', content: userInput},
+    ];
+
+    // Update conversation state and clear user input
+    setConversation(newConversation);
+    setUserInput('');
+    setIsGenerating(true);
+
+    console.log('newConversation', newConversation);
+    try {
+      const stopWords = [
+        '</s>',
+        '<|end|>',
+        'user:',
+        'assistant:',
+        '<|im_end|>',
+        '<|eot_id|>',
+        '<|end▁of▁sentence|>',
+        '<｜end▁of▁sentence｜>',
+      ];
+      const result = await context.completion(
+        {
+          messages: newConversation,
+          n_predict: 10000,
+          stop: stopWords,
+        },
+        (data: {token: string}) => {
+          // This is a partial completion callback
+          const {token} = data;
+        },
+      );
+      console.log('result', result.text);
+      console.log('context', context);
+      // Ensure the result has text before updating the conversation
+      if (result && result.text) {
+        setConversation(prev => [
+          ...prev,
+          {role: 'assistant', content: result.text.trim()},
+        ]);
+      } else {
+        throw new Error('No response from the model.');
+      }
+    } catch (error) {
+      // Handle errors during inference
+      Alert.alert(
+        'Error During Inference',
+        error instanceof Error ? error.message : 'An unknown error occurred.',
+      );
+    } finally {
+      setIsGenerating(false);
+    }
+  };
 
   useEffect(() => {
 
     const initializeModel = async () => {
+
+      const fileExists = await RNFS.exists(MODEL_PATH);
+      if (!fileExists) {
+        Alert.alert('Error Loading Model', 'The model file does not exist.');
+        return
+      }
+
+      if (context) {
+        await releaseAllLlama();
+        setContext(null);
+      }
+
       try {
         const llamaContext = await initLlama({
           model: MODEL_PATH,
@@ -161,7 +247,6 @@ function ChatScreen({ route }: any) {
           n_gpu_layers: 1
         });
         setContext(llamaContext);
-        generateResponse();
 
       } catch (error) {
         Alert.alert("Error", "Failed to initialize model");
@@ -169,6 +254,7 @@ function ChatScreen({ route }: any) {
     };
 
     initializeModel();
+    handleSendMessage();
 
     return () => {
       if (context) {
@@ -177,36 +263,7 @@ function ChatScreen({ route }: any) {
     };
   }, []);
 
-  const generateResponse = async () => {
-    if (!context) return;
-
-    setIsGenerating(true);
-    try {
-      const result = await context.completion(
-        {
-          messages: conversation,
-          n_predict: 1000,
-          stop: ["</s>", "<|end|>", "user:", "assistant:"]
-        },
-        (data: any) => {
-          setConversation(prev => {
-            const newConvo = [...prev];
-            const lastMessage = newConvo[newConvo.length - 1];
-            if (lastMessage.role === "assistant") {
-              lastMessage.content += data.token;
-            }
-            return newConvo;
-          });
-        }
-      );
-
-      setConversation(prev => [...prev, { role: "user", content: "" }]);
-    } catch (error) {
-      Alert.alert("Error", "Failed to generate response");
-    } finally {
-      setIsGenerating(false);
-    }
-  };
+  
 
   return (
     <SafeAreaView style={styles.chatContainer}>
@@ -218,7 +275,7 @@ function ChatScreen({ route }: any) {
           ref={scrollViewRef}
           contentContainerStyle={styles.messagesContainer}
         >
-          {conversation.map((msg, index) => (
+          {conversation.slice(1).map((msg, index) => (
             <View key={index} style={[
               styles.messageBubble,
               msg.role === 'user' ? styles.userBubble : styles.assistantBubble
