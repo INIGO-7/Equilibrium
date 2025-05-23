@@ -6,6 +6,7 @@ import ProgressBar from './src/components/ProgressBar';
 import { downloadModel } from './src/api/model';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { initLlama, releaseAllLlama } from 'llama.rn';
+import { ModelProvider, useModel } from './src/api/context';
 
 type RootStackParamList = {
   Onboarding: undefined;
@@ -25,64 +26,10 @@ const INITIAL_CONVERSATION: Message[] = [
       'This is a conversation between user and assistant, a friendly chatbot.',
   },
 ];
-
-const MODEL_FILE = 'dolphin-2.9.4-gemma2-2b-Q4_K_M.gguf'
-const MODEL_REPO = 'bartowski/dolphin-2.9.4-gemma2-2b-GGUF'
+const MODEL_FILE = 'Llama-3.2-1B-Instruct-Q6_K_L.gguf'
+const MODEL_REPO = 'bartowski/Llama-3.2-1B-Instruct-GGUF'
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/${MODEL_FILE}`
 const MODEL_URL = `https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}`
-
-// Home Screen Component
-function HomeScreen({ navigation }: any) {
-  const [message, setMessage] = useState('');
-
-  const sendAndNavigate = () => {
-    if (message.trim()) {
-      navigation.navigate('Chat', { initialMessage: message });
-      setMessage('');
-    }
-  };
-
-  return (
-    <SafeAreaView style={styles.container}>
-      {/* Background Layers */}
-      <View style={styles.backgroundContainer}>
-        {/* Base White Layer */}
-        <View style={styles.baseLayer} />
-
-        {/* Diffused Circles - Deep Layer */}
-        <View style={[styles.circle, styles.deepCircle1]} />
-        <View style={[styles.circle, styles.deepCircle2]} />
-        <View style={[styles.circle, styles.deepCircle3]} />
-
-        {/* Diffused Circles - Mid Layer */}
-        <View style={[styles.circle, styles.midCircle1]} />
-        <View style={[styles.circle, styles.midCircle2]} />
-
-        {/* Overlay Color Layer */}
-        <View style={styles.colorOverlay} />
-      </View>
-
-      {/* Content */}
-      <View style={styles.content}>
-        <Text style={styles.title}>EQUILIBRIUM</Text>
-        <View style={styles.inputContainer}>
-          <TextInput
-            style={styles.input}
-            placeholder="How have you been feeling today?"
-            placeholderTextColor="#A6B5D9"
-            value={message}
-            onChangeText={setMessage}
-            multiline
-            onSubmitEditing={sendAndNavigate}
-          />
-          <TouchableOpacity style={styles.sendButton} onPress={sendAndNavigate}>
-            <Text style={styles.buttonText}>→</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </SafeAreaView>
-  );
-}
 
 // Onboarding Screen Component
 function OnboardingScreen({ navigation }: any) {
@@ -149,30 +96,121 @@ function OnboardingScreen({ navigation }: any) {
   );
 }
 
+// Home Screen Component
+function HomeScreen({ navigation }: any) {
+  const [message, setMessage] = useState('');
+  const [isModelLoading, setIsModelLoading] = useState(true);
+  const { context, setContext } = useModel();
+
+  const sendAndNavigate = () => {
+    if (isModelLoading || !context) {
+        Alert.alert("Please wait until the model's loaded.");
+    } else if (message.trim()) {
+      navigation.navigate('Chat', { initialMessage: message });
+      setMessage('');
+    } else {
+        Alert.alert("Please write a message before pressing the 'send' button");
+    }
+  };
+
+  useEffect(() => {
+
+    const initializeModel = async () => {
+
+      const fileExists = await RNFS.exists(MODEL_PATH);
+      if (!fileExists) {
+        Alert.alert('Error Loading Model', 'The model file does not exist.');
+        return
+      }
+
+      try {
+        setIsModelLoading(true);
+        const llamaContext = await initLlama({
+          model: MODEL_PATH,
+          n_ctx: 2048,
+          n_gpu_layers: 1
+        });
+        setContext(llamaContext);
+
+      } catch (error) {
+        Alert.alert("Error", "Failed to initialize model");
+      } finally {
+        Alert.alert("The model was loaded correctly!");
+        setIsModelLoading(false);
+      }
+    };
+
+    initializeModel();
+  }, []);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      {/* Background Layers */}
+      <View style={styles.backgroundContainer}>
+        {/* Base White Layer */}
+        <View style={styles.baseLayer} />
+
+        {/* Diffused Circles - Deep Layer */}
+        <View style={[styles.circle, styles.deepCircle1]} />
+        <View style={[styles.circle, styles.deepCircle2]} />
+        <View style={[styles.circle, styles.deepCircle3]} />
+
+        {/* Diffused Circles - Mid Layer */}
+        <View style={[styles.circle, styles.midCircle1]} />
+        <View style={[styles.circle, styles.midCircle2]} />
+
+        {/* Overlay Color Layer */}
+        <View style={styles.colorOverlay} />
+      </View>
+
+      {/* Content */}
+      <View style={styles.content}>
+        <Text style={styles.title}>EQUILIBRIUM</Text>
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            placeholder="How have you been feeling today?"
+            placeholderTextColor="#A6B5D9"
+            value={message}
+            onChangeText={setMessage}
+            multiline
+            onSubmitEditing={sendAndNavigate}
+          />
+          <TouchableOpacity style={styles.sendButton} onPress={sendAndNavigate}>
+            <Text style={styles.buttonText}>→</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+}
+
 // Chat Screen Component
 function ChatScreen({ route }: any) {
   const [conversation, setConversation] = 
     useState<Message[]>(INITIAL_CONVERSATION);
-  const [context, setContext] = useState<any>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const scrollViewRef = useRef<ScrollView>(null);
-  const [userInput, setUserInput] = useState<string>(route.params.initialMessage);
+  const [userInput, setUserInput] = useState<string>('');
+  const { context } = useModel();
 
-  const handleSendMessage = async () => {
+  const handleSendMessage = async (input? : string) => {
     // Check if context is loaded and user input is valid
     if (!context) {
       Alert.alert('Model Not Loaded', 'Please load the model first.');
       return;
     }
 
-    if (!userInput.trim()) {
+    const finalInput = input ?? userInput;
+
+    if (!finalInput.trim()) {
       Alert.alert('Input Error', 'Please enter a message.');
       return;
     } 
 
     const newConversation: Message[] = [
       ...conversation,
-      {role: 'user', content: userInput},
+      {role: 'user', content: finalInput},
     ];
 
     // Update conversation state and clear user input
@@ -195,7 +233,7 @@ function ChatScreen({ route }: any) {
       const result = await context.completion(
         {
           messages: newConversation,
-          n_predict: 10000,
+          n_predict: 40,
           stop: stopWords,
         },
         (data: {token: string}) => {
@@ -226,44 +264,13 @@ function ChatScreen({ route }: any) {
   };
 
   useEffect(() => {
-
-    const initializeModel = async () => {
-
-      const fileExists = await RNFS.exists(MODEL_PATH);
-      if (!fileExists) {
-        Alert.alert('Error Loading Model', 'The model file does not exist.');
-        return
-      }
-
-      if (context) {
-        await releaseAllLlama();
-        setContext(null);
-      }
-
-      try {
-        const llamaContext = await initLlama({
-          model: MODEL_PATH,
-          n_ctx: 2048,
-          n_gpu_layers: 1
-        });
-        setContext(llamaContext);
-
-      } catch (error) {
-        Alert.alert("Error", "Failed to initialize model");
+    const sendInitialMessage = async () => {
+      if (route.params?.initialMessage) {
+        await handleSendMessage(route.params.initialMessage);
       }
     };
-
-    initializeModel();
-    handleSendMessage();
-
-    return () => {
-      if (context) {
-        releaseAllLlama();
-      }
-    };
+    sendInitialMessage();
   }, []);
-
-  
 
   return (
     <SafeAreaView style={styles.chatContainer}>
@@ -286,6 +293,25 @@ function ChatScreen({ route }: any) {
             </View>
           ))}
         </ScrollView>
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            placeholder="Type your message..."
+            placeholderTextColor="#94A3B8"
+            value={userInput}
+            onChangeText={setUserInput}
+          />
+          <View style={styles.buttonRow}>
+            <TouchableOpacity
+              style={styles.sendButton}
+              onPress={() => handleSendMessage()}
+              disabled={isGenerating}>
+              <Text style={styles.buttonText}>
+                {isGenerating ? '...' : 'Send'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -407,6 +433,11 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 20,
     fontWeight: '600',
+  },
+  buttonRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 8,
   },
   chatContainer: {
     flex: 1,
@@ -533,14 +564,19 @@ export default function App() {
   }
 
   return (
-    <NavigationContainer>
-      <Stack.Navigator screenOptions={{ headerShown: false }}>
-        {!isModelReady && (
-          <Stack.Screen name="Onboarding" component={OnboardingScreen} />
+    <ModelProvider>
+      <NavigationContainer>
+        {!isModelReady ? (
+          <Stack.Navigator screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="Onboarding" component={OnboardingScreen} />
+          </Stack.Navigator>
+        ) : (
+          <Stack.Navigator screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="Home" component={HomeScreen} />
+            <Stack.Screen name="Chat" component={ChatScreen} />
+          </Stack.Navigator>
         )}
-        <Stack.Screen name="Home" component={HomeScreen} />
-        <Stack.Screen name="Chat" component={ChatScreen} />
-      </Stack.Navigator>
-    </NavigationContainer>
+      </NavigationContainer>
+    </ModelProvider>
   );
 }
