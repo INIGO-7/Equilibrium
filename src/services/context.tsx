@@ -1,23 +1,15 @@
 import React, { createContext, useContext, useState } from 'react';
 
-interface ModelContextType {
-  llamaContext: any;
-  setLlamaContext: React.Dispatch<React.SetStateAction<any>>;
-  isRAGReady: boolean;
-  setIsRAGReady: React.Dispatch<React.SetStateAction<boolean>>;
-}
+const ModelContext = createContext<any>(null);
 
-const ModelContext = createContext<ModelContextType | null>(null);
-
-export const useModel = () => useContext(ModelContext)!;
+export const useModel = () => useContext(ModelContext);
 
 export const ModelProvider = ({ children }: any) => {
-  const [llamaContext, setLlamaContext] = useState<any>(null);
-  const [isRAGReady, setIsRAGReady] = useState(false);
-
+  const [context, setContext] = useState<any>(null);
+  
   return (
-    <ModelContext.Provider value={{ llamaContext, setLlamaContext, isRAGReady, setIsRAGReady }}>
+    <ModelContext.Provider value={{ context, setContext }}>
       {children}
     </ModelContext.Provider>
   );
-};
+};;

@@ -3,16 +3,11 @@ import { SafeAreaView, StyleSheet, Text, View, TouchableOpacity, TextInput, Scro
 import { NavigationContainer } from '@react-navigation/native';
 import RNFS from 'react-native-fs';
 import ProgressBar from './src/components/ProgressBar';
-import { downloadModel } from './src/api/model';
+import { downloadModel } from './src/services/model';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { initLlama, releaseAllLlama } from 'llama.rn';
-import { ModelProvider, useModel } from './src/api/context';
-
-type RootStackParamList = {
-  Onboarding: undefined;
-  Home: undefined;
-  Chat: { initialMessage: string };
-};
+import { initLlama } from 'llama.rn';
+import { ModelProvider, useModel } from './src/services/context';
+import RAGService from './src/services/ragService';
 
 type Message = {
   role: "system" | "user" | "assistant";
@@ -26,6 +21,7 @@ const INITIAL_CONVERSATION: Message[] = [
       'This is a conversation between user and assistant, a friendly chatbot.',
   },
 ];
+
 const MODEL_FILE = 'Llama-3.2-1B-Instruct-Q6_K_L.gguf'
 const MODEL_REPO = 'bartowski/Llama-3.2-1B-Instruct-GGUF'
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/${MODEL_FILE}`
@@ -42,7 +38,7 @@ function OnboardingScreen({ navigation }: any) {
       const destPath = await downloadModel(
         MODEL_FILE,
         MODEL_URL,
-        (progress) => setDownloadProgress(progress)
+        (progress: any) => setDownloadProgress(progress)
       );
       
       // Verify model file
@@ -98,49 +94,63 @@ function OnboardingScreen({ navigation }: any) {
 
 // Home Screen Component
 function HomeScreen({ navigation }: any) {
-  const [message, setMessage] = useState('');
-  const [isModelLoading, setIsModelLoading] = useState(true);
-  const { context, setContext } = useModel();
+  const [ message, setMessage ] = useState('');
+  const [ isModelLoading, setIsModelLoading ] = useState(true);
+  const { llamaContext, setLlamaContext, isRAGReady, setIsRAGReady } = useModel();
 
   const sendAndNavigate = () => {
-    if (isModelLoading || !context) {
-        Alert.alert("Please wait until the model's loaded.");
+    if (isModelLoading || !llamaContext || !isRAGReady) {
+      Alert.alert("Please wait until the model and RAG are loaded.");
     } else if (message.trim()) {
       navigation.navigate('Chat', { initialMessage: message });
       setMessage('');
     } else {
-        Alert.alert("Please write a message before pressing the 'send' button");
+      Alert.alert("Please write a message before pressing the 'send' button");
     }
   };
 
   useEffect(() => {
 
-    const initializeModel = async () => {
-
-      const fileExists = await RNFS.exists(MODEL_PATH);
-      if (!fileExists) {
-        Alert.alert('Error Loading Model', 'The model file does not exist.');
-        return
-      }
+    const initializeServices = async () => {
+      setIsModelLoading(true);
 
       try {
-        setIsModelLoading(true);
+        // init LLM 
+        const fileExists = await RNFS.exists(MODEL_PATH);
+
+        if (!fileExists) {
+          Alert.alert('Error Loading LLM model', 'The model file does not exist.');
+          return;
+        }
+
         const llamaContext = await initLlama({
           model: MODEL_PATH,
           n_ctx: 2048,
           n_gpu_layers: 1
         });
-        setContext(llamaContext);
+        setLlamaContext(llamaContext);
+
+        // init RAGService
+        await RAGService.initialize();
+        setIsRAGReady(true);
+
+        Alert.alert("Success", "Model and RAG service loaded successfully!");
 
       } catch (error) {
-        Alert.alert("Error", "Failed to initialize model");
+        console.error(error);
+        if (!llamaContext) {
+          Alert.alert("Error", "Failed to initialize LLM");
+        } 
+        if (!isRAGReady) {
+          Alert.alert("Error", "Failed to initialize RAG system")
+        }
       } finally {
         Alert.alert("The model was loaded correctly!");
         setIsModelLoading(false);
       }
     };
 
-    initializeModel();
+    initializeServices();
   }, []);
 
   return (
@@ -190,14 +200,19 @@ function ChatScreen({ route }: any) {
   const [conversation, setConversation] = 
     useState<Message[]>(INITIAL_CONVERSATION);
   const [isGenerating, setIsGenerating] = useState(false);
-  const scrollViewRef = useRef<ScrollView>(null);
   const [userInput, setUserInput] = useState<string>('');
-  const { context } = useModel();
+  const scrollViewRef = useRef<ScrollView>(null);
 
-  const handleSendMessage = async (input? : string) => {
+  const { llamaContext, isRAGReady } = useModel();
+
+  const handleSendMessage = async (input?: string) => {
     // Check if context is loaded and user input is valid
-    if (!context) {
-      Alert.alert('Model Not Loaded', 'Please load the model first.');
+    if (!llamaContext) {
+      Alert.alert('LLM not ready', 'Please make it available first.');
+      return;
+    }
+    if (!isRAGReady) {
+      Alert.alert('RAG not ready', 'Please make it available first.');
       return;
     }
 
@@ -208,41 +223,48 @@ function ChatScreen({ route }: any) {
       return;
     } 
 
-    const newConversation: Message[] = [
+    const newConversation : Message[] = [
       ...conversation,
       {role: 'user', content: finalInput},
     ];
 
-    // Update conversation state and clear user input
+    // 1. perform RAG search
+    let ragResults;
+    try {
+      ragResults = await RAGService.searchSimilar(finalInput, {
+        topK: 5,
+        threshold: 0.1,
+      });
+    } catch (error) {
+      Alert.alert('RAG Search Failed', 'Could not perform similarity search.');
+      return;
+    }
+
+    // 2. Update UI state
     setConversation(newConversation);
     setUserInput('');
     setIsGenerating(true);
 
+    // 3. LLM completion
     console.log('newConversation', newConversation);
     try {
       const stopWords = [
-        '</s>',
-        '<|end|>',
-        'user:',
-        'assistant:',
-        '<|im_end|>',
-        '<|eot_id|>',
-        '<|end▁of▁sentence|>',
+        '</s>', '<|end|>', 'user:', 'assistant:',
+        '<|im_end|>', '<|eot_id|>', '<|end▁of▁sentence|>',
         '<｜end▁of▁sentence｜>',
       ];
-      const result = await context.completion(
+      const result = await llamaContext.completion(
         {
           messages: newConversation,
           n_predict: 40,
           stop: stopWords,
         },
-        (data: {token: string}) => {
-          // This is a partial completion callback
+        (data: {token: any}) => {
+          // This is a partial completion callback for live streaming tokens
           const {token} = data;
         },
       );
-      console.log('result', result.text);
-      console.log('context', context);
+
       // Ensure the result has text before updating the conversation
       if (result && result.text) {
         setConversation(prev => [
@@ -252,10 +274,14 @@ function ChatScreen({ route }: any) {
       } else {
         throw new Error('No response from the model.');
       }
+
+      console.log('RAG search results:', ragResults);
+      console.log('LLM result:  ', result.text);
+
     } catch (error) {
       // Handle errors during inference
       Alert.alert(
-        'Error During Inference',
+        'Inference error',
         error instanceof Error ? error.message : 'An unknown error occurred.',
       );
     } finally {
