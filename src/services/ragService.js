@@ -1,79 +1,122 @@
 import { openDatabase } from 'react-native-sqlite-storage';
-import { pipeline } from '@fugood/transformers'
+import { Platform } from 'react-native';
+import RNFS from 'react-native-fs';
+import { InferenceSession, Tensor } from 'onnxruntime-react-native';
+import { Tokenizer } from 'tokenizers'; // JS‑only bindings that work in RN
 
+/**
+ * RAG service — local (on‑device) inference + SQLite persistence.
+ * Only minimal changes were made to make the class work with
+ * react‑native‑onnxruntime and an on‑device Sentence‑Transformers model.
+ */
 class RAGService {
   constructor() {
     this.db = null;
-    this.extractor = null;
+    this.session = null;          // ONNX inference session
+    this.tokenizer = null;        // HF tokenizer
     this.isInitialized = false;
     this.isInitializing = false;
-    this.modelName = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
+
+    // Asset‑relative paths (kept in the project’s /assets or /android_asset/)
+    this.modelPath = 'models/paraphrase-multilingual-MiniLM-L12-v2/model.onnx';
+    this.tokenizerPath = 'models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json';
     this.dbName = 'mental_health.db';
   }
 
-  /**
-   * Initialize the RAG service - loads embedding model and opens database
-   */
+  /** Initialise everything (idempotent) */
   async initialize(databasePath = null) {
-    if (this.isInitialized) {
-      console.log('RAG Service already initialized');
-      return;
-    }
-
+    if (this.isInitialized) return;
     if (this.isInitializing) {
-      console.log('RAG Service initialization in progress...');
-      // Wait for initialization to complete
-      while (this.isInitializing) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
+      // wait for the first caller to finish
+      while (this.isInitializing) await new Promise(r => setTimeout(r, 50));
       return;
     }
-
     this.isInitializing = true;
-
     try {
-      console.log('🚀 Initializing RAG Service...');
-
-      // Initialize embedding model
+      console.log('🚀 Initialising RAG service…');
       await this.initializeEmbeddingModel();
-
-      // Initialize database
       await this.initializeDatabase(databasePath);
-
       this.isInitialized = true;
+      console.log('✅ RAG service initialised');
+    } finally {
       this.isInitializing = false;
-      console.log('✅ RAG Service initialized successfully!');
-
-    } catch (error) {
-      this.isInitializing = false;
-      console.error('❌ Failed to initialize RAG Service:', error);
-      throw error;
     }
   }
 
   /**
-   * Initialize the embedding model
+   * Load the tokenizer JSON and create the ONNX Runtime session.
+   * We avoid Tokenizer.fromFile() because it relies on the Node fs API.
    */
   async initializeEmbeddingModel() {
-    try {
-      console.log('📥 Loading embedding model...');
-      this.extractor = await pipeline(
-        'feature-extraction', 
-        this.modelName,
-        {
-          // quantized: true, // Use quantized model for better performance
-          progress_callback: (progress) => {
-            if (progress.status === 'downloading') {
-              console.log(`📥 Downloading model: ${Math.round(progress.progress || 0)}%`);
-            }
-          }
-        }
-      );
-      console.log('✅ Embedding model loaded successfully');
-    } catch (error) {
-      console.error('❌ Failed to load embedding model:', error);
-      throw error;
+    console.log('📥 Loading tokenizer & ONNX model…');
+
+    // --- tokenizer --------------------------------------------------------
+    const tokenizerJson = await this._loadAsset(this.tokenizerPath, 'utf8');
+    this.tokenizer = await Tokenizer.fromString(tokenizerJson);
+
+    // --- model ------------------------------------------------------------
+    const modelURI = this._resolveModelURI(this.modelPath);
+    this.session = await InferenceSession.create(modelURI, {
+      executionProviders: ['cpu'] // mobile only supports CPU at the moment
+    });
+
+    console.log('✅ Embedding model ready');
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Embeddings
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** Return a normalised embedding for the supplied text. */
+  async embedText(text) {
+    if (!this.session || !this.tokenizer) {
+      throw new Error('RAGService not initialised');
     }
+
+    // Tokenise
+    const encoded = this.tokenizer.encode(text);
+    const ids32 = Int32Array.from(encoded.ids);
+    const mask32 = Int32Array.from(encoded.attentionMask ?? new Array(ids32.length).fill(1));
+
+    // ONNX Runtime mobile doesn’t accept JS BigInt literals, so we build the
+    // int64 tensors manually.
+    const ids64 = new BigInt64Array(ids32.length);
+    const mask64 = new BigInt64Array(mask32.length);
+    for (let i = 0; i < ids32.length; ++i) {
+      ids64[i] = BigInt(ids32[i]);
+      mask64[i] = BigInt(mask32[i]);
+    }
+
+    const feeds = {
+      input_ids: new Tensor('int64', ids64, [1, ids64.length]),
+      attention_mask: new Tensor('int64', mask64, [1, mask64.length])
+    };
+
+    const outputMap = await this.session.run(feeds);
+    const firstKey = Object.keys(outputMap)[0];
+    const outTensor = outputMap['sentence_embedding'] // SBERT export
+      ?? outputMap['last_hidden_state']               // fallback (pre‑pool)
+      ?? outputMap[firstKey];
+
+    // If the model already produced a pooled vector we’re done
+    let vector;
+    if (outTensor.dims.length === 2) {
+      vector = outTensor.data; // [1, hidden]
+    } else {
+      // Mean‑pool token embeddings → sentence embedding
+      const [_, seqLen, hidden] = outTensor.dims;
+      const sum = new Float32Array(hidden);
+      for (let i = 0; i < seqLen; ++i) {
+        for (let j = 0; j < hidden; ++j) {
+          sum[j] += outTensor.data[i * hidden + j];
+        }
+      }
+      vector = sum.map(v => v / seqLen);
+    }
+
+    // L2‑normalise
+    const norm = Math.hypot(...vector);
+    return Array.from(vector.map(v => v / (norm || 1)));
   }
 
   /**
@@ -143,20 +186,47 @@ class RAGService {
   }
 
   /**
-   * Generate embedding for a text
+   * Generate embedding for a text using on-device ONNX model
    */
   async embedText(text) {
-    if (!this.isInitialized || !this.extractor) {
+    if (!this.session || !this.tokenizer) {
       throw new Error('RAG Service not initialized. Call initialize() first.');
     }
 
     try {
-      const result = await this.extractor(text, {
-        pooling: 'mean',
-        normalize: true
-      });
-      
-      return Array.from(result.data);
+      // Tokenize input text
+      const encoded = this.tokenizer.encode(text);
+      const inputIds = Int32Array.from(encoded.ids);
+      const attentionMask = Int32Array.from(encoded.attentionMask);
+
+      // Prepare ONNX inputs
+      const feeds = {
+        input_ids: new Tensor('int64', inputIds, [1, inputIds.length]),
+        attention_mask: new Tensor('int64', attentionMask, [1, attentionMask.length])
+      };
+
+      // Run inference
+      const results = await this.session.run(feeds);
+      const output = results['last_hidden_state'] || results[Object.keys(results)[0]];
+
+      // output.dims = [1, seqLen, hiddenSize]
+      const [batch, seqLen, hiddenSize] = output.dims;
+      const data = output.data;
+
+      // Mean pooling over sequence dimension
+      const sumVec = new Float32Array(hiddenSize);
+      for (let i = 0; i < seqLen; i++) {
+        for (let j = 0; j < hiddenSize; j++) {
+          sumVec[j] += data[i * hiddenSize + j];
+        }
+      }
+      const meanVec = sumVec.map(v => v / seqLen);
+
+      // Normalize vector
+      const norm = Math.sqrt(meanVec.reduce((acc, v) => acc + v * v, 0));
+      const normalized = meanVec.map(v => (norm > 0 ? v / norm : 0));
+
+      return Array.from(normalized);
     } catch (error) {
       console.error('❌ Failed to generate embedding:', error);
       throw error;
@@ -455,6 +525,23 @@ class RAGService {
         );
       });
     });
+  }
+
+  /** Read a bundled asset on both platforms. */
+  async _loadAsset(relativePath, encoding = 'utf8') {
+    if (Platform.OS === 'ios') {
+      return RNFS.readFile(`${RNFS.MainBundlePath}/${relativePath}`, encoding);
+    }
+    // Android (assets packaged under android_asset)
+    return RNFS.readFileAssets(relativePath, encoding);
+  }
+
+  /** Convert an asset‑relative path to a URI accepted by ONNX Runtime. */
+  _resolveModelURI(relativePath) {
+    if (Platform.OS === 'ios') {
+      return `${RNFS.MainBundlePath}/${relativePath}`;
+    }
+    return `file:///android_asset/${relativePath}`;
   }
 }
 
