@@ -11,14 +11,11 @@
   },
   "dependencies": {
     "@expo/vector-icons": "^14.1.0",
-    "@fugood/transformers": "^3.5.1-beta.1",
     "@react-navigation/native": "^7.1.8",
     "@react-navigation/native-stack": "^7.3.12",
     "console-warn": "^0.0.4",
     "expo-linear-gradient": "^14.1.4",
     "llama.rn": "^0.5.9",
-    "onnxruntime-common": "^1.22.0",
-    "onnxruntime-react-native": "^1.22.0",
     "react": "19.0.0",
     "react-native": "0.79.2",
     "react-native-fs": "^2.20.0",
@@ -27,7 +24,8 @@
     "react-native-screens": "^4.10.0",
     "react-native-sqlite-storage": "^6.0.1",
     "react-native-vector-icons": "^10.2.0",
-    "text-encoding": "^0.7.0"
+    "text-encoding": "^0.7.0",
+    "tokenizers": "^0.13.3"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

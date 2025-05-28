@@ -26,6 +26,7 @@ const MODEL_FILE = 'Llama-3.2-1B-Instruct-Q6_K_L.gguf'
 const MODEL_REPO = 'bartowski/Llama-3.2-1B-Instruct-GGUF'
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/${MODEL_FILE}`
 const MODEL_URL = `https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}`
+const LLAMA_POOLING_TYPE_MEAN = 1
 
 // Onboarding Screen Component
 function OnboardingScreen({ navigation }: any) {
@@ -96,7 +97,7 @@ function OnboardingScreen({ navigation }: any) {
 function HomeScreen({ navigation }: any) {
   const [ message, setMessage ] = useState('');
   const [ isModelLoading, setIsModelLoading ] = useState(true);
-  const { llamaContext, setLlamaContext, isRAGReady, setIsRAGReady } = useModel();
+  const { llamaContext, setLlamaContext, embeddingContext, setEmbeddingContext, isRAGReady, setIsRAGReady } = useModel();
 
   const sendAndNavigate = () => {
     if (isModelLoading || !llamaContext || !isRAGReady) {
@@ -130,6 +131,13 @@ function HomeScreen({ navigation }: any) {
         });
         setLlamaContext(llamaContext);
 
+        const embeddingContext = await initLlama({
+          model: MODEL_PATH,
+          embedding: true,
+          pooling_type: "mean"
+        })
+        setEmbeddingContext(embeddingContext);
+
         // init RAGService
         await RAGService.initialize();
         setIsRAGReady(true);
@@ -145,7 +153,6 @@ function HomeScreen({ navigation }: any) {
           Alert.alert("Error", "Failed to initialize RAG system")
         }
       } finally {
-        Alert.alert("The model was loaded correctly!");
         setIsModelLoading(false);
       }
     };
@@ -203,7 +210,7 @@ function ChatScreen({ route }: any) {
   const [userInput, setUserInput] = useState<string>('');
   const scrollViewRef = useRef<ScrollView>(null);
 
-  const { llamaContext, isRAGReady } = useModel();
+  const { llamaContext, isRAGReady, embeddingContext } = useModel();
 
   const handleSendMessage = async (input?: string) => {
     // Check if context is loaded and user input is valid
@@ -228,24 +235,35 @@ function ChatScreen({ route }: any) {
       {role: 'user', content: finalInput},
     ];
 
-    // 1. perform RAG search
+    // 1. Build the embedding with llama.rn
+    let embedding: number[];
+    try {
+      // `embed` returns a Float32Array
+      embedding = await embeddingContext.embedding(finalInput).embedding;
+    } catch (err) {
+      console.error('❌ Embedding error:', err);
+      Alert.alert('Embedding error', 'Could not create an embedding');
+      return;
+    }
+
+    // 2. Search the db for similar documents using RAG service
     let ragResults;
     try {
-      ragResults = await RAGService.searchSimilar(finalInput, {
+      ragResults = await RAGService.searchSimilar(embedding, {
         topK: 5,
-        threshold: 0.1,
+        threshold: 0.4,
       });
     } catch (error) {
       Alert.alert('RAG Search Failed', 'Could not perform similarity search.');
       return;
     }
 
-    // 2. Update UI state
+    // 3. Update UI state
     setConversation(newConversation);
     setUserInput('');
     setIsGenerating(true);
 
-    // 3. LLM completion
+    // 4. LLM completion
     console.log('newConversation', newConversation);
     try {
       const stopWords = [
@@ -256,7 +274,7 @@ function ChatScreen({ route }: any) {
       const result = await llamaContext.completion(
         {
           messages: newConversation,
-          n_predict: 40,
+          n_predict: 80,
           stop: stopWords,
         },
         (data: {token: any}) => {
@@ -275,9 +293,6 @@ function ChatScreen({ route }: any) {
         throw new Error('No response from the model.');
       }
 
-      console.log('RAG search results:', ragResults);
-      console.log('LLM result:  ', result.text);
-
     } catch (error) {
       // Handle errors during inference
       Alert.alert(
@@ -287,6 +302,16 @@ function ChatScreen({ route }: any) {
     } finally {
       setIsGenerating(false);
     }
+
+    // Finally, log the results to ensure everything ran smoothly:
+    const latestAssistantMessage = conversation
+    .slice()
+    .reverse()
+    .find(msg => msg.role === 'assistant')?.content;
+
+    // TODO: change with real rag results
+    console.log('RAG search results:', ragResults);
+    console.log('LLM result:  ', latestAssistantMessage);
   };
 
   useEffect(() => {
@@ -592,17 +617,15 @@ export default function App() {
   return (
     <ModelProvider>
       <NavigationContainer>
-        {!isModelReady ? (
-          <Stack.Navigator screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="Onboarding" component={OnboardingScreen} />
-          </Stack.Navigator>
-        ) : (
-          <Stack.Navigator screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="Home" component={HomeScreen} />
-            <Stack.Screen name="Chat" component={ChatScreen} />
-          </Stack.Navigator>
-        )}
+      <Stack.Navigator
+        initialRouteName={isModelReady ? 'Home' : 'Onboarding'}
+        screenOptions={{ headerShown: false }}
+      >
+          <Stack.Screen name="Onboarding" component={OnboardingScreen} />
+          <Stack.Screen name="Home" component={HomeScreen} />
+          <Stack.Screen name="Chat" component={ChatScreen} />
+        </Stack.Navigator>
       </NavigationContainer>
     </ModelProvider>
   );
-}
+} 

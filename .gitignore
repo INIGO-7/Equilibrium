@@ -1,3 +1,7 @@
+# Additional
+*.db
+*.sqlite
+
 # OSX
 #
 .DS_Store

@@ -1,182 +1,93 @@
-import { openDatabase } from 'react-native-sqlite-storage';
-import { Platform } from 'react-native';
-import RNFS from 'react-native-fs';
-import { InferenceSession, Tensor } from 'onnxruntime-react-native';
-import { Tokenizer } from 'tokenizers'; // JS‑only bindings that work in RN
+import { enablePromise, openDatabase, SQLiteDatabase } from 'react-native-sqlite-storage';
 
 /**
- * RAG service — local (on‑device) inference + SQLite persistence.
- * Only minimal changes were made to make the class work with
- * react‑native‑onnxruntime and an on‑device Sentence‑Transformers model.
+ * RAG service — local (on-device) similarity search + SQLite persistence.
+ * ───────────────────────────────────────────────────────────────────────────
+ *  ⚠️  This version expects *pre-computed* embeddings to be supplied by the
+ *      caller.  No ONNX model or tokenizer is loaded here.
+ * ───────────────────────────────────────────────────────────────────────────
  */
 class RAGService {
   constructor() {
     this.db = null;
-    this.session = null;          // ONNX inference session
-    this.tokenizer = null;        // HF tokenizer
     this.isInitialized = false;
     this.isInitializing = false;
 
-    // Asset‑relative paths (kept in the project’s /assets or /android_asset/)
-    this.modelPath = 'models/paraphrase-multilingual-MiniLM-L12-v2/model.onnx';
-    this.tokenizerPath = 'models/paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json';
-    this.dbName = 'mental_health.db';
+    // Bundled DB name (if you ship a starter DB with your app)
+    this.dbName = 'mental_health_llama32-1B_final.sqlite';
   }
 
-  /** Initialise everything (idempotent) */
-  async initialize(databasePath = null) {
+  // ──────────────────────────────────────────────────────────────────────
+  // Initialisation
+  // ──────────────────────────────────────────────────────────────────────
+  async initialize() {
     if (this.isInitialized) return;
+
     if (this.isInitializing) {
-      // wait for the first caller to finish
       while (this.isInitializing) await new Promise(r => setTimeout(r, 50));
       return;
     }
+  
     this.isInitializing = true;
+  
     try {
       console.log('🚀 Initialising RAG service…');
-      await this.initializeEmbeddingModel();
-      await this.initializeDatabase(databasePath);
+      await this.initializeDatabase();
       this.isInitialized = true;
       console.log('✅ RAG service initialised');
+    } catch (error) {
+      console.error('❌ Failed to initialize database:', error.message, error);
     } finally {
       this.isInitializing = false;
-    }
+    } 
   }
 
-  /**
-   * Load the tokenizer JSON and create the ONNX Runtime session.
-   * We avoid Tokenizer.fromFile() because it relies on the Node fs API.
-   */
-  async initializeEmbeddingModel() {
-    console.log('📥 Loading tokenizer & ONNX model…');
-
-    // --- tokenizer --------------------------------------------------------
-    const tokenizerJson = await this._loadAsset(this.tokenizerPath, 'utf8');
-    this.tokenizer = await Tokenizer.fromString(tokenizerJson);
-
-    // --- model ------------------------------------------------------------
-    const modelURI = this._resolveModelURI(this.modelPath);
-    this.session = await InferenceSession.create(modelURI, {
-      executionProviders: ['cpu'] // mobile only supports CPU at the moment
-    });
-
-    console.log('✅ Embedding model ready');
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Embeddings
-  // ──────────────────────────────────────────────────────────────────────────
-
-  /** Return a normalised embedding for the supplied text. */
-  async embedText(text) {
-    if (!this.session || !this.tokenizer) {
-      throw new Error('RAGService not initialised');
-    }
-
-    // Tokenise
-    const encoded = this.tokenizer.encode(text);
-    const ids32 = Int32Array.from(encoded.ids);
-    const mask32 = Int32Array.from(encoded.attentionMask ?? new Array(ids32.length).fill(1));
-
-    // ONNX Runtime mobile doesn’t accept JS BigInt literals, so we build the
-    // int64 tensors manually.
-    const ids64 = new BigInt64Array(ids32.length);
-    const mask64 = new BigInt64Array(mask32.length);
-    for (let i = 0; i < ids32.length; ++i) {
-      ids64[i] = BigInt(ids32[i]);
-      mask64[i] = BigInt(mask32[i]);
-    }
-
-    const feeds = {
-      input_ids: new Tensor('int64', ids64, [1, ids64.length]),
-      attention_mask: new Tensor('int64', mask64, [1, mask64.length])
-    };
-
-    const outputMap = await this.session.run(feeds);
-    const firstKey = Object.keys(outputMap)[0];
-    const outTensor = outputMap['sentence_embedding'] // SBERT export
-      ?? outputMap['last_hidden_state']               // fallback (pre‑pool)
-      ?? outputMap[firstKey];
-
-    // If the model already produced a pooled vector we’re done
-    let vector;
-    if (outTensor.dims.length === 2) {
-      vector = outTensor.data; // [1, hidden]
-    } else {
-      // Mean‑pool token embeddings → sentence embedding
-      const [_, seqLen, hidden] = outTensor.dims;
-      const sum = new Float32Array(hidden);
-      for (let i = 0; i < seqLen; ++i) {
-        for (let j = 0; j < hidden; ++j) {
-          sum[j] += outTensor.data[i * hidden + j];
-        }
-      }
-      vector = sum.map(v => v / seqLen);
-    }
-
-    // L2‑normalise
-    const norm = Math.hypot(...vector);
-    return Array.from(vector.map(v => v / (norm || 1)));
-  }
-
-  /**
-   * Initialize the SQLite database
-   */
-  async initializeDatabase(databasePath = null) {
+  // ──────────────────────────────────────────────────────────────────────
+  // SQLite
+  // ──────────────────────────────────────────────────────────────────────
+  async initializeDatabase() {
+    console.log('📂 Opening database...');
     return new Promise((resolve, reject) => {
-      try {
-        console.log('📂 Opening database...');
-        
-        const dbConfig = databasePath 
-          ? { name: databasePath, location: 'Documents' }
-          : { name: this.dbName, 
-            createFromLocation: 1,
-            location: 'default'
-          };
-
-        this.db = openDatabase(
-          dbConfig,
-          () => {
-            console.log('✅ Database opened successfully');
-            this.verifyDatabaseStructure()
-              .then(() => resolve())
-              .catch(reject);
-          },
-          (error) => {
-            console.error('❌ Failed to open database:', error);
-            reject(error);
-          }
-        );
-      } catch (error) {
-        console.error('❌ Database initialization error:', error);
-        reject(error);
-      }
+      this.db = openDatabase(
+        {
+          name: this.dbName,
+          location: 'default',
+        },
+        () => {
+          console.log('✅ Database opened successfully');
+          resolve();
+        },
+        error => {
+          console.error('❌ Failed to open database:', error.message, error);
+          reject(error);
+        }
+      );
     });
-  }
+  } 
 
-  /**
-   * Verify database structure
-   */
   async verifyDatabaseStructure() {
     return new Promise((resolve, reject) => {
       this.db.transaction(tx => {
         tx.executeSql(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('documents', 'collections')",
+          "SELECT name FROM sqlite_master WHERE type='table' AND name=='documents';",
           [],
-          (tx, results) => {
+          (_, results) => {
             const tables = [];
             for (let i = 0; i < results.rows.length; i++) {
               tables.push(results.rows.item(i).name);
             }
-            
-            if (tables.includes('documents') && tables.includes('collections')) {
+            if (tables.includes('documents')) {
               console.log('✅ Database structure verified');
               resolve();
             } else {
-              reject(new Error(`Missing required tables. Found: ${tables.join(', ')}`));
+              reject(
+                new Error(
+                  `Missing required tables. Found: ${tables.join(', ')}`
+                )
+              );
             }
           },
-          (tx, error) => {
+          (_, error) => {
             console.error('❌ Database structure verification failed:', error);
             reject(error);
           }
@@ -185,249 +96,70 @@ class RAGService {
     });
   }
 
-  /**
-   * Generate embedding for a text using on-device ONNX model
-   */
-  async embedText(text) {
-    if (!this.session || !this.tokenizer) {
-      throw new Error('RAG Service not initialized. Call initialize() first.');
-    }
-
-    try {
-      // Tokenize input text
-      const encoded = this.tokenizer.encode(text);
-      const inputIds = Int32Array.from(encoded.ids);
-      const attentionMask = Int32Array.from(encoded.attentionMask);
-
-      // Prepare ONNX inputs
-      const feeds = {
-        input_ids: new Tensor('int64', inputIds, [1, inputIds.length]),
-        attention_mask: new Tensor('int64', attentionMask, [1, attentionMask.length])
-      };
-
-      // Run inference
-      const results = await this.session.run(feeds);
-      const output = results['last_hidden_state'] || results[Object.keys(results)[0]];
-
-      // output.dims = [1, seqLen, hiddenSize]
-      const [batch, seqLen, hiddenSize] = output.dims;
-      const data = output.data;
-
-      // Mean pooling over sequence dimension
-      const sumVec = new Float32Array(hiddenSize);
-      for (let i = 0; i < seqLen; i++) {
-        for (let j = 0; j < hiddenSize; j++) {
-          sumVec[j] += data[i * hiddenSize + j];
-        }
-      }
-      const meanVec = sumVec.map(v => v / seqLen);
-
-      // Normalize vector
-      const norm = Math.sqrt(meanVec.reduce((acc, v) => acc + v * v, 0));
-      const normalized = meanVec.map(v => (norm > 0 ? v / norm : 0));
-
-      return Array.from(normalized);
-    } catch (error) {
-      console.error('❌ Failed to generate embedding:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Convert blob to embedding array
-   */
+  // ──────────────────────────────────────────────────────────────────────
+  // Vector utilities
+  // ──────────────────────────────────────────────────────────────────────
+  /** Convert BLOB (stored Float32) → JS number[] */
   blobToEmbedding(blob) {
-    // Convert blob to Float32Array then to regular array
-    const buffer = new ArrayBuffer(blob.length);
-    const view = new Uint8Array(buffer);
-    for (let i = 0; i < blob.length; i++) {
-      view[i] = blob.charCodeAt(i);
+    if (blob instanceof ArrayBuffer) {
+      return Array.from(new Float32Array(blob));
+    } else if (blob.buffer instanceof ArrayBuffer) {
+      return Array.from(new Float32Array(blob.buffer));
+    } else {
+      throw new Error("Unexpected blob data type");
     }
-    const float32Array = new Float32Array(buffer);
-    return Array.from(float32Array);
   }
 
-  /**
-   * Calculate cosine similarity between two vectors
-   */
-  cosineSimilarity(vecA, vecB) {
-    if (vecA.length !== vecB.length) {
+  /** Cosine similarity (both vectors assumed same length) */
+  cosineSimilarity(a, b) {
+    if (a.length !== b.length)
       throw new Error('Vectors must have the same length');
+    let dot = 0,
+      na = 0,
+      nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
     }
-
-    let dotProduct = 0;
-    let normA = 0;
-    let normB = 0;
-
-    for (let i = 0; i < vecA.length; i++) {
-      dotProduct += vecA[i] * vecB[i];
-      normA += vecA[i] * vecA[i];
-      normB += vecB[i] * vecB[i];
-    }
-
-    normA = Math.sqrt(normA);
-    normB = Math.sqrt(normB);
-
-    if (normA === 0 || normB === 0) {
-      return 0;
-    }
-
-    return dotProduct / (normA * normB);
+    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
   }
 
+  // ──────────────────────────────────────────────────────────────────────
+  // Public API
+  // ──────────────────────────────────────────────────────────────────────
   /**
-   * Search for similar documents
+   * Search similar documents.
+   * @param {string|number[]} query  Either a plain string **(unsupported here)**
+   *                                 or a pre-computed embedding array.
+   * @param {object} options         topK, threshold, collectionName, includeEmbeddings
    */
-  async searchSimilar(query, options = {}) {
-    if (!this.isInitialized) {
-      throw new Error('RAG Service not initialized. Call initialize() first.');
-    }
+  async searchSimilar(embedding, options = {}) {
+    if (!this.isInitialized)
+      throw new Error('RAG Service not initialised. Call initialize() first.');
+
+    console.log('Searching for the most similar documents to user query embedding')
 
     const {
       topK = 5,
-      threshold = 0.0,
-      collectionName = null,
+      threshold = 0.7,
       includeEmbeddings = false
     } = options;
 
-    try {
-      console.log(`🔍 Searching for: "${query.substring(0, 50)}..."`);
+    const results = await this.performSimilaritySearch(
+      embedding,
+      topK,
+      threshold,
+      includeEmbeddings
+    );
 
-      // Generate query embedding
-      const queryEmbedding = await this.embedText(query);
-
-      // Search in database
-      const results = await this.performSimilaritySearch(
-        queryEmbedding, 
-        topK, 
-        threshold, 
-        collectionName,
-        includeEmbeddings
-      );
-
-      console.log(`✅ Found ${results.length} similar documents`);
-      return results;
-
-    } catch (error) {
-      console.error('❌ Search failed:', error);
-      throw error;
-    }
+    console.log(`✅ Found ${results.length} similar documents`);
+    return results;
   }
 
   /**
-   * Perform similarity search in database
-   */
-  async performSimilaritySearch(queryEmbedding, topK, threshold, collectionName, includeEmbeddings) {
-    return new Promise((resolve, reject) => {
-      let sql = 'SELECT id, content, embedding, metadata, collection_name FROM documents';
-      let params = [];
-
-      if (collectionName) {
-        sql += ' WHERE collection_name = ?';
-        params.push(collectionName);
-      }
-
-      this.db.transaction(tx => {
-        tx.executeSql(
-          sql,
-          params,
-          (tx, results) => {
-            const similarities = [];
-
-            for (let i = 0; i < results.rows.length; i++) {
-              const row = results.rows.item(i);
-              
-              try {
-                // Convert blob to embedding
-                const docEmbedding = this.blobToEmbedding(row.embedding);
-                
-                // Calculate similarity
-                const similarity = this.cosineSimilarity(queryEmbedding, docEmbedding);
-
-                if (similarity >= threshold) {
-                  const result = {
-                    id: row.id,
-                    content: row.content,
-                    metadata: JSON.parse(row.metadata || '{}'),
-                    collectionName: row.collection_name,
-                    similarity: similarity
-                  };
-
-                  if (includeEmbeddings) {
-                    result.embedding = docEmbedding;
-                  }
-
-                  similarities.push(result);
-                }
-              } catch (embeddingError) {
-                console.warn(`⚠️ Failed to process document ${row.id}:`, embeddingError);
-              }
-            }
-
-            // Sort by similarity (descending) and limit results
-            similarities.sort((a, b) => b.similarity - a.similarity);
-            const topResults = similarities.slice(0, topK);
-
-            resolve(topResults);
-          },
-          (tx, error) => {
-            console.error('❌ Database search error:', error);
-            reject(error);
-          }
-        );
-      });
-    });
-  }
-
-  /**
-   * Get database statistics
-   */
-  async getStats() {
-    if (!this.isInitialized) {
-      throw new Error('RAG Service not initialized. Call initialize() first.');
-    }
-
-    return new Promise((resolve, reject) => {
-      this.db.transaction(tx => {
-        // Get collection stats
-        tx.executeSql(
-          'SELECT * FROM collections',
-          [],
-          (tx, results) => {
-            const collections = [];
-            for (let i = 0; i < results.rows.length; i++) {
-              collections.push(results.rows.item(i));
-            }
-
-            // Get total document count
-            tx.executeSql(
-              'SELECT COUNT(*) as total_documents FROM documents',
-              [],
-              (tx, countResults) => {
-                const totalDocuments = countResults.rows.item(0).total_documents;
-
-                resolve({
-                  totalDocuments,
-                  collections,
-                  modelName: this.modelName,
-                  isInitialized: this.isInitialized
-                });
-              },
-              (tx, error) => {
-                reject(error);
-              }
-            );
-          },
-          (tx, error) => {
-            reject(error);
-          }
-        );
-      });
-    });
-  }
-
-  /**
-   * Perform retrieval - search and generate context
+   * High-level Retrieval helper – builds a context window from top-K docs.
+   * Accepts either a string (unsupported) or an embedding array.
    */
   async retrieval(query, options = {}) {
     const {
@@ -437,113 +169,118 @@ class RAGService {
       maxContextLength = 2000
     } = options;
 
-    try {
-      // Search for similar documents
-      const similarDocs = await this.searchSimilar(query, {
-        topK,
-        threshold,
-        collectionName
+    const similarDocs = await this.searchSimilar(query, {
+      topK,
+      threshold,
+      collectionName
+    });
+
+    let context = '';
+    let ctxLen = 0;
+    const used = [];
+
+    for (const doc of similarDocs) {
+      const chunk = `${doc.content}\n\n`;
+      if (ctxLen + chunk.length > maxContextLength) break;
+      context += chunk;
+      ctxLen += chunk.length;
+      used.push({
+        id: doc.id,
+        similarity: doc.similarity,
+        collectionName: doc.collectionName
       });
-
-      // Build context from similar documents
-      let context = '';
-      let contextLength = 0;
-      const usedDocs = [];
-
-      for (const doc of similarDocs) {
-        const docText = `${doc.content}\n\n`;
-        
-        if (contextLength + docText.length <= maxContextLength) {
-          context += docText;
-          contextLength += docText.length;
-          usedDocs.push({
-            id: doc.id,
-            similarity: doc.similarity,
-            collectionName: doc.collectionName
-          });
-        } else {
-          break;
-        }
-      }
-
-      return {
-        query,
-        context: context.trim(),
-        contextLength,
-        documentsUsed: usedDocs,
-        totalDocumentsFound: similarDocs.length
-      };
-
-    } catch (error) {
-      console.error('❌ RAG operation failed:', error);
-      throw error;
     }
+
+    return {
+      query,
+      context: context.trim(),
+      contextLength: ctxLen,
+      documentsUsed: used,
+      totalDocumentsFound: similarDocs.length
+    };
   }
 
-  /**
-   * Close the database connection
-   */
+  /** Close DB */
   async close() {
     if (this.db) {
       this.db.close();
       this.db = null;
     }
-    this.extractor = null;
     this.isInitialized = false;
     console.log('🔒 RAG Service closed');
   }
 
-  /**
-   * Get a specific document by ID
-   */
+  /** Fetch single document by ID */
   async getDocument(documentId) {
-    if (!this.isInitialized) {
-      throw new Error('RAG Service not initialized. Call initialize() first.');
-    }
-
+    if (!this.isInitialized)
+      throw new Error('RAG Service not initialised. Call initialize() first.');
     return new Promise((resolve, reject) => {
       this.db.transaction(tx => {
         tx.executeSql(
           'SELECT id, content, metadata, collection_name FROM documents WHERE id = ?',
           [documentId],
-          (tx, results) => {
-            if (results.rows.length > 0) {
-              const row = results.rows.item(0);
+          (_, results) => {
+            if (results.rows.length)
               resolve({
-                id: row.id,
-                content: row.content,
-                metadata: JSON.parse(row.metadata || '{}'),
-                collectionName: row.collection_name
+                id: results.rows.item(0).id,
+                content: results.rows.item(0).content,
+                metadata: JSON.parse(results.rows.item(0).metadata || '{}'),
+                collectionName: results.rows.item(0).collection_name
               });
-            } else {
-              resolve(null);
-            }
+            else resolve(null);
           },
-          (tx, error) => {
+          (_, error) => reject(error)
+        );
+      });
+    });
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Internal helpers
+  // ──────────────────────────────────────────────────────────────────────
+  // TODO: remove limit 100!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  async performSimilaritySearch(
+    queryEmbedding,
+    topK,
+    threshold,
+    includeEmbeddings
+  ) {
+    return new Promise((resolve, reject) => {
+      this.db.transaction(tx => {
+        tx.executeSql(
+          `SELECT id, chunk_text, embedding FROM documents LIMIT 100`,
+          params,
+          (_, results) => {
+            const sims = [];
+            for (let i = 0; i < results.rows.length; i++) {
+              const row = results.rows.item(i);
+              try {
+                const docVec = this.blobToEmbedding(row.embedding);
+                const sim = this.cosineSimilarity(queryEmbedding, docVec);
+                if (sim >= threshold) {
+                  sims.push({
+                    id: row.id,
+                    content: row.chunk_text,
+                    similarity: sim,
+                    ...(includeEmbeddings ? { embedding: docVec } : {})
+                  });
+                }
+              } catch (e) {
+                console.warn(`⚠️  Skipping doc ${row.id}:`, e);
+              }
+            }
+            sims.sort((a, b) => b.similarity - a.similarity);
+            resolve(sims.slice(0, topK));
+          },
+          (_, error) => {
+            console.error('❌ Database search error:', error);
             reject(error);
           }
         );
       });
     });
   }
-
-  /** Read a bundled asset on both platforms. */
-  async _loadAsset(relativePath, encoding = 'utf8') {
-    if (Platform.OS === 'ios') {
-      return RNFS.readFile(`${RNFS.MainBundlePath}/${relativePath}`, encoding);
-    }
-    // Android (assets packaged under android_asset)
-    return RNFS.readFileAssets(relativePath, encoding);
-  }
-
-  /** Convert an asset‑relative path to a URI accepted by ONNX Runtime. */
-  _resolveModelURI(relativePath) {
-    if (Platform.OS === 'ios') {
-      return `${RNFS.MainBundlePath}/${relativePath}`;
-    }
-    return `file:///android_asset/${relativePath}`;
-  }
 }
 
-// Export singleton instance
+// Export singleton
 export default new RAGService();

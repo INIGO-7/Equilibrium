@@ -4,6 +4,8 @@ import React, { createContext, useContext, useState, ReactNode } from 'react';
 export interface ModelContextType {
   llamaContext: any;
   setLlamaContext: React.Dispatch<React.SetStateAction<any>>;
+  embeddingContext: any;
+  setEmbeddingContext: React.Dispatch<React.SetStateAction<any>>;
   isRAGReady: boolean;
   setIsRAGReady: React.Dispatch<React.SetStateAction<boolean>>;
 }
@@ -28,11 +30,12 @@ interface ModelProviderProps {
 // Provider component with proper type annotations
 export const ModelProvider: React.FC<ModelProviderProps> = ({ children }) => {
   const [llamaContext, setLlamaContext] = useState<any>(null);
+  const [embeddingContext, setEmbeddingContext] = useState<any>(null);
   const [isRAGReady, setIsRAGReady] = useState<boolean>(false);
 
   return (
     <ModelContext.Provider
-      value={{ llamaContext, setLlamaContext, isRAGReady, setIsRAGReady }}
+      value={{ llamaContext, setLlamaContext, embeddingContext, setEmbeddingContext, isRAGReady, setIsRAGReady }}
     >
       {children}
     </ModelContext.Provider>
