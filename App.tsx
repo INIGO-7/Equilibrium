@@ -126,7 +126,7 @@ function HomeScreen({ navigation }: any) {
 
         const llamaContext = await initLlama({
           model: MODEL_PATH,
-          n_ctx: 2048,
+          n_ctx: 1024,
           n_gpu_layers: 1
         });
         setLlamaContext(llamaContext);
@@ -134,12 +134,14 @@ function HomeScreen({ navigation }: any) {
         const embeddingContext = await initLlama({
           model: MODEL_PATH,
           embedding: true,
-          pooling_type: "mean"
+          pooling_type: "mean",
+          n_ctx: 256
         })
         setEmbeddingContext(embeddingContext);
 
         // init RAGService
         await RAGService.initialize();
+        await RAGService.testDatabaseConnection();
         setIsRAGReady(true);
 
         Alert.alert("Success", "Model and RAG service loaded successfully!");
@@ -238,8 +240,9 @@ function ChatScreen({ route }: any) {
     // 1. Build the embedding with llama.rn
     let embedding: number[];
     try {
-      // `embed` returns a Float32Array
-      embedding = await embeddingContext.embedding(finalInput).embedding;
+      const resp = await embeddingContext.embedding(finalInput);
+      embedding = resp.embedding;
+      console.log('✅ Embedding created. Embedding: ', embedding);
     } catch (err) {
       console.error('❌ Embedding error:', err);
       Alert.alert('Embedding error', 'Could not create an embedding');
@@ -254,7 +257,7 @@ function ChatScreen({ route }: any) {
         threshold: 0.4,
       });
     } catch (error) {
-      Alert.alert('RAG Search Failed', 'Could not perform similarity search.');
+      console.error('❌ RAG Search Failed - Could not perform similarity search. Error: ', error);
       return;
     }
 

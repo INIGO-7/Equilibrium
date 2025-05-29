@@ -1,4 +1,6 @@
-import { enablePromise, openDatabase, SQLiteDatabase } from 'react-native-sqlite-storage';
+import { openDatabase } from '@boltcode/react-native-sqlite-storage'
+
+// DON'T use enablePromise(true) - use callbacks instead
 
 /**
  * RAG service — local (on-device) similarity search + SQLite persistence.
@@ -33,10 +35,15 @@ class RAGService {
     try {
       console.log('🚀 Initialising RAG service…');
       await this.initializeDatabase();
+      
+      // Add database validation
+      await this.validateDatabase();
+      
       this.isInitialized = true;
       console.log('✅ RAG service initialised');
     } catch (error) {
       console.error('❌ Failed to initialize database:', error.message, error);
+      throw error; // Re-throw to let caller handle
     } finally {
       this.isInitializing = false;
     } 
@@ -50,8 +57,8 @@ class RAGService {
     return new Promise((resolve, reject) => {
       this.db = openDatabase(
         {
-          name: this.dbName,
-          location: 'default',
+          name: "mental_health_db",
+          createFromLocation: "~www/" + this.dbName
         },
         () => {
           console.log('✅ Database opened successfully');
@@ -63,36 +70,48 @@ class RAGService {
         }
       );
     });
-  } 
+  }
 
-  async verifyDatabaseStructure() {
+  // Add database validation method (Callback-based)
+  async validateDatabase() {
+    console.log('🔍 Validating database structure...');
     return new Promise((resolve, reject) => {
-      this.db.transaction(tx => {
-        tx.executeSql(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name=='documents';",
-          [],
-          (_, results) => {
-            const tables = [];
-            for (let i = 0; i < results.rows.length; i++) {
-              tables.push(results.rows.item(i).name);
-            }
-            if (tables.includes('documents')) {
-              console.log('✅ Database structure verified');
+      this.db.executeSql(
+        `SELECT COUNT(*) as count FROM documents`,
+        [],
+        (results) => {
+          const count = results.rows.item(0).count;
+          console.log(`📊 Found ${count} documents in database`);
+          
+          // Get a sample row to check structure
+          this.db.executeSql(
+            `SELECT id, chunk_text, typeof(embedding) as embedding_type, length(embedding) as embedding_size 
+             FROM documents LIMIT 1`,
+            [],
+            (sampleResults) => {
+              if (sampleResults.rows.length > 0) {
+                const sample = sampleResults.rows.item(0);
+                console.log('📋 Sample document structure:', {
+                  id: sample.id,
+                  text_length: sample.chunk_text?.length || 0,
+                  embedding_type: sample.embedding_type,
+                  embedding_size: sample.embedding_size
+                });
+              }
+              console.log('✅ Database validation completed');
               resolve();
-            } else {
-              reject(
-                new Error(
-                  `Missing required tables. Found: ${tables.join(', ')}`
-                )
-              );
+            },
+            (error) => {
+              console.error('❌ Error getting sample document:', error);
+              reject(error);
             }
-          },
-          (_, error) => {
-            console.error('❌ Database structure verification failed:', error);
-            reject(error);
-          }
-        );
-      });
+          );
+        },
+        (error) => {
+          console.error('❌ Error validating database:', error);
+          reject(error);
+        }
+      );
     });
   }
 
@@ -101,19 +120,25 @@ class RAGService {
   // ──────────────────────────────────────────────────────────────────────
   /** Convert BLOB (stored Float32) → JS number[] */
   blobToEmbedding(blob) {
-    if (blob instanceof ArrayBuffer) {
-      return Array.from(new Float32Array(blob));
-    } else if (blob.buffer instanceof ArrayBuffer) {
-      return Array.from(new Float32Array(blob.buffer));
-    } else {
-      throw new Error("Unexpected blob data type");
+    try {
+      if (blob instanceof ArrayBuffer) {
+        return Array.from(new Float32Array(blob));
+      } else if (blob && blob.buffer instanceof ArrayBuffer) {
+        return Array.from(new Float32Array(blob.buffer));
+      } else {
+        console.warn('Unexpected blob type:', typeof blob, blob);
+        throw new Error("Unexpected blob data type");
+      }
+    } catch (error) {
+      console.error('Error converting blob to embedding:', error);
+      throw error;
     }
   }
 
   /** Cosine similarity (both vectors assumed same length) */
   cosineSimilarity(a, b) {
     if (a.length !== b.length)
-      throw new Error('Vectors must have the same length');
+      throw new Error(`Vectors must have the same length: ${a.length} vs ${b.length}`);
     let dot = 0,
       na = 0,
       nb = 0;
@@ -122,23 +147,25 @@ class RAGService {
       na += a[i] * a[i];
       nb += b[i] * b[i];
     }
-    return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+    const similarity = dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
+    return similarity;
   }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Public API
-  // ──────────────────────────────────────────────────────────────────────
   /**
    * Search similar documents.
-   * @param {string|number[]} query  Either a plain string **(unsupported here)**
-   *                                 or a pre-computed embedding array.
-   * @param {object} options         topK, threshold, collectionName, includeEmbeddings
+   * @param {number[]} embedding     Pre-computed embedding array
+   * @param {object} options         topK, threshold, includeEmbeddings
    */
   async searchSimilar(embedding, options = {}) {
     if (!this.isInitialized)
       throw new Error('RAG Service not initialised. Call initialize() first.');
 
-    console.log('Searching for the most similar documents to user query embedding')
+    if (!Array.isArray(embedding) || embedding.length === 0) {
+      console.log('Input embedding: ', embedding);
+      throw new Error('Invalid embedding: must be non-empty array');
+    }
+
+    console.log(`🔍 Searching for similar documents (embedding dim: ${embedding.length})`);
 
     const {
       topK = 5,
@@ -146,138 +173,125 @@ class RAGService {
       includeEmbeddings = false
     } = options;
 
-    const results = await this.performSimilaritySearch(
-      embedding,
-      topK,
-      threshold,
-      includeEmbeddings
-    );
+    const startTime = Date.now();
+    
+    try {
+      const results = await this.performSimilaritySearch(
+        embedding,
+        topK,
+        threshold,
+        includeEmbeddings
+      );
 
-    console.log(`✅ Found ${results.length} similar documents`);
-    return results;
-  }
-
-  /**
-   * High-level Retrieval helper – builds a context window from top-K docs.
-   * Accepts either a string (unsupported) or an embedding array.
-   */
-  async retrieval(query, options = {}) {
-    const {
-      topK = 3,
-      threshold = 0.1,
-      collectionName = null,
-      maxContextLength = 2000
-    } = options;
-
-    const similarDocs = await this.searchSimilar(query, {
-      topK,
-      threshold,
-      collectionName
-    });
-
-    let context = '';
-    let ctxLen = 0;
-    const used = [];
-
-    for (const doc of similarDocs) {
-      const chunk = `${doc.content}\n\n`;
-      if (ctxLen + chunk.length > maxContextLength) break;
-      context += chunk;
-      ctxLen += chunk.length;
-      used.push({
-        id: doc.id,
-        similarity: doc.similarity,
-        collectionName: doc.collectionName
-      });
+      const duration = Date.now() - startTime;
+      console.log(`✅ Found ${results.length} similar documents in ${duration}ms`);
+      return results;
+    } catch (error) {
+      console.error('❌ Error in similarity search:', error);
+      throw error;
     }
-
-    return {
-      query,
-      context: context.trim(),
-      contextLength: ctxLen,
-      documentsUsed: used,
-      totalDocumentsFound: similarDocs.length
-    };
   }
 
-  /** Close DB */
-  async close() {
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-    }
-    this.isInitialized = false;
-    console.log('🔒 RAG Service closed');
-  }
-
-  /** Fetch single document by ID */
-  async getDocument(documentId) {
-    if (!this.isInitialized)
-      throw new Error('RAG Service not initialised. Call initialize() first.');
-    return new Promise((resolve, reject) => {
-      this.db.transaction(tx => {
-        tx.executeSql(
-          'SELECT id, content, metadata, collection_name FROM documents WHERE id = ?',
-          [documentId],
-          (_, results) => {
-            if (results.rows.length)
-              resolve({
-                id: results.rows.item(0).id,
-                content: results.rows.item(0).content,
-                metadata: JSON.parse(results.rows.item(0).metadata || '{}'),
-                collectionName: results.rows.item(0).collection_name
-              });
-            else resolve(null);
-          },
-          (_, error) => reject(error)
-        );
-      });
-    });
-  }
-
-  // ──────────────────────────────────────────────────────────────────────
-  // Internal helpers
-  // ──────────────────────────────────────────────────────────────────────
-  // TODO: remove limit 100!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   async performSimilaritySearch(
     queryEmbedding,
     topK,
     threshold,
     includeEmbeddings
   ) {
+    console.log('🔄 Starting similarity search...');
+    
     return new Promise((resolve, reject) => {
-      this.db.transaction(tx => {
-        tx.executeSql(
-          `SELECT id, chunk_text, embedding FROM documents LIMIT 100`,
-          params,
-          (_, results) => {
-            const sims = [];
-            for (let i = 0; i < results.rows.length; i++) {
+      const searchStartTime = Date.now();
+      
+      this.db.executeSql(
+        `SELECT id, chunk_text, embedding FROM documents`,
+        [],
+        (results) => {
+          console.log(`📊 Retrieved ${results.rows.length} documents from database`);
+          
+          const sims = [];
+          let processedCount = 0;
+          let errorCount = 0;
+          
+          for (let i = 0; i < results.rows.length; i++) {
+            try {
               const row = results.rows.item(i);
-              try {
-                const docVec = this.blobToEmbedding(row.embedding);
-                const sim = this.cosineSimilarity(queryEmbedding, docVec);
-                if (sim >= threshold) {
-                  sims.push({
-                    id: row.id,
-                    content: row.chunk_text,
-                    similarity: sim,
-                    ...(includeEmbeddings ? { embedding: docVec } : {})
-                  });
-                }
-              } catch (e) {
-                console.warn(`⚠️  Skipping doc ${row.id}:`, e);
+              
+              // Log every 100th row to track progress
+              if (i % 100 === 0) {
+                console.log(`[DEBUG] Processing document ${i + 1}/${results.rows.length}`);
+              }
+              
+              if (i === 0) {
+                console.log("[DEBUG] - First database row:", {
+                  id: row.id,
+                  text_preview: row.chunk_text?.substring(0, 100) + '...',
+                  embedding_type: typeof row.embedding,
+                  embedding_length: row.embedding?.length || 'unknown'
+                });
+              }
+              
+              const docVec = this.blobToEmbedding(row.embedding);
+              const sim = this.cosineSimilarity(queryEmbedding, docVec);
+              
+              if (sim >= threshold) {
+                sims.push({
+                  id: row.id,
+                  content: row.chunk_text,
+                  similarity: sim,
+                  ...(includeEmbeddings ? { embedding: docVec } : {})
+                });
+              }
+              
+              processedCount++;
+            } catch (e) {
+              errorCount++;
+              if (errorCount <= 5) { // Only log first 5 errors to avoid spam
+                console.warn(`⚠️  Error processing doc ${i}:`, e.message);
               }
             }
-            sims.sort((a, b) => b.similarity - a.similarity);
-            resolve(sims.slice(0, topK));
-          },
-          (_, error) => {
-            console.error('❌ Database search error:', error);
-            reject(error);
           }
-        );
-      });
+          
+          console.log(`📈 Processed: ${processedCount}, Errors: ${errorCount}, Above threshold: ${sims.length}`);
+          
+          // Sort by similarity (highest first)
+          sims.sort((a, b) => b.similarity - a.similarity);
+          
+          const finalResults = sims.slice(0, topK);
+          const searchDuration = Date.now() - searchStartTime;
+          
+          console.log(`⚡ Search completed in ${searchDuration}ms`);
+          console.log(`🎯 Top similarities:`, finalResults.map(r => ({ id: r.id, sim: r.similarity.toFixed(4) })));
+          
+          resolve(finalResults);
+        },
+        (error) => {
+          console.error('❌ SQL execution error:', error);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  // Add method to test database connectivity (Callback-based)
+  async testDatabaseConnection() {
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+    
+    return new Promise((resolve, reject) => {
+      this.db.executeSql(
+        'SELECT 1 as test',
+        [],
+        (results) => {
+          console.log('✅ Database connection test passed');
+          resolve(true);
+        },
+        (error) => {
+          console.error('❌ Database connection test failed:', error);
+          reject(error);
+        }
+      );
     });
   }
 }
