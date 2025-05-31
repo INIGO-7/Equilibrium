@@ -16,7 +16,7 @@ class RAGService {
     this.isInitializing = false;
 
     // Bundled DB name (if you ship a starter DB with your app)
-    this.dbName = 'mental_health_llama32-1B_final.sqlite';
+    this.dbName = 'mental_health_llama32-1B_final_II.sqlite';
   }
 
   // ──────────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ class RAGService {
           
           // Get a sample row to check structure
           this.db.executeSql(
-            `SELECT id, chunk_text, typeof(embedding) as embedding_type, length(embedding) as embedding_size 
+            `SELECT id, chunk_text, embedding, typeof(embedding) as embedding_type, length(embedding) as embedding_size 
              FROM documents LIMIT 1`,
             [],
             (sampleResults) => {
@@ -95,7 +95,8 @@ class RAGService {
                   id: sample.id,
                   text_length: sample.chunk_text?.length || 0,
                   embedding_type: sample.embedding_type,
-                  embedding_size: sample.embedding_size
+                  embedding_size: sample.embedding_size,
+                  embedding: JSON.parse(sample.embedding)
                 });
               }
               console.log('✅ Database validation completed');
@@ -222,16 +223,7 @@ class RAGService {
                 console.log(`[DEBUG] Processing document ${i + 1}/${results.rows.length}`);
               }
               
-              if (i === 0) {
-                console.log("[DEBUG] - First database row:", {
-                  id: row.id,
-                  text_preview: row.chunk_text?.substring(0, 100) + '...',
-                  embedding_type: typeof row.embedding,
-                  embedding_length: row.embedding?.length || 'unknown'
-                });
-              }
-              
-              const docVec = this.blobToEmbedding(row.embedding);
+              const docVec = JSON.parse(row.embedding);
               const sim = this.cosineSimilarity(queryEmbedding, docVec);
               
               if (sim >= threshold) {

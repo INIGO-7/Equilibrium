@@ -22,6 +22,15 @@ const INITIAL_CONVERSATION: Message[] = [
   },
 ];
 
+const PROMPT_TEMPLATE = "Please play the role of a psychiatrist. Your task is to conduct a " +
+"professional diagnosis conversation with me based on the DSM-5 criteria, but using your own " +
+"language. Your questions should cover at least the following aspects: emotion, sleep, " +
+"weight and appetite, loss of interest, energy, social function, self-harm or suicide, " +
+"history. You are free to choose the order of questions, but you must collect complete " +
+"information on all aspects in the end. Please only ask one question at a time. You need to ask " +
+"in-depth questions, such as the duration, causes and specific manifestations of some symptoms." +
+"Using these instructions and taking into account previous messages, respond to the new patient's message:";
+
 const MODEL_FILE = 'Llama-3.2-1B-Instruct-Q6_K_L.gguf'
 const MODEL_REPO = 'bartowski/Llama-3.2-1B-Instruct-GGUF'
 const MODEL_PATH = `${RNFS.DocumentDirectoryPath}/${MODEL_FILE}`
@@ -126,7 +135,7 @@ function HomeScreen({ navigation }: any) {
 
         const llamaContext = await initLlama({
           model: MODEL_PATH,
-          n_ctx: 1024,
+          n_ctx: 4096,
           n_gpu_layers: 1
         });
         setLlamaContext(llamaContext);
@@ -237,7 +246,12 @@ function ChatScreen({ route }: any) {
       {role: 'user', content: finalInput},
     ];
 
-    // 1. Build the embedding with llama.rn
+    // 1. Update UI state
+    setConversation(newConversation);
+    setUserInput('');
+    setIsGenerating(true);
+
+    // 2. Build the embedding with llama.rn
     let embedding: number[];
     try {
       const resp = await embeddingContext.embedding(finalInput);
@@ -249,35 +263,52 @@ function ChatScreen({ route }: any) {
       return;
     }
 
-    // 2. Search the db for similar documents using RAG service
+    // 3. Search the db for similar documents using RAG service
     let ragResults;
     try {
       ragResults = await RAGService.searchSimilar(embedding, {
-        topK: 5,
+        topK: 2,
         threshold: 0.4,
       });
+      console.log("RAG document results: ", ragResults);
     } catch (error) {
       console.error('❌ RAG Search Failed - Could not perform similarity search. Error: ', error);
       return;
     }
 
-    // 3. Update UI state
-    setConversation(newConversation);
-    setUserInput('');
-    setIsGenerating(true);
-
     // 4. LLM completion
-    console.log('newConversation', newConversation);
+    // Use the 'newConversation' not to wait for 'conversation' UI and state updates
+    console.log('Updated conversation: ', newConversation);
     try {
       const stopWords = [
         '</s>', '<|end|>', 'user:', 'assistant:',
         '<|im_end|>', '<|eot_id|>', '<|end▁of▁sentence|>',
         '<｜end▁of▁sentence｜>',
       ];
+
+      const ragTexts = ragResults.map((item:any, idx:any) => {
+        // Prefix with 'Document' and index
+        return `Document ${idx + 1}:\n${item.content.trim()}`;
+      }).join('\n\n');
+
+      const augmentedUserContent = 
+      `Here are some relevant documents to consider before answering:\n\n${ragTexts}\n\n---\n\n` +
+      PROMPT_TEMPLATE + `\n` + finalInput;
+
+      const lastMsgIndex = newConversation.length - 1;
+      const messagesForLlama = [
+        // everything up to but not including the last message
+        ...newConversation.slice(0, lastMsgIndex),
+        // Replace last user message with the augmented version
+        { role: 'user', content: augmentedUserContent },
+      ];
+    
+      console.log("Check if content's correctly passed to the Llama -->", messagesForLlama);
+
       const result = await llamaContext.completion(
         {
-          messages: newConversation,
-          n_predict: 80,
+          messages: messagesForLlama,
+          max_tokens: 300,
           stop: stopWords,
         },
         (data: {token: any}) => {
@@ -305,16 +336,6 @@ function ChatScreen({ route }: any) {
     } finally {
       setIsGenerating(false);
     }
-
-    // Finally, log the results to ensure everything ran smoothly:
-    const latestAssistantMessage = conversation
-    .slice()
-    .reverse()
-    .find(msg => msg.role === 'assistant')?.content;
-
-    // TODO: change with real rag results
-    console.log('RAG search results:', ragResults);
-    console.log('LLM result:  ', latestAssistantMessage);
   };
 
   useEffect(() => {
