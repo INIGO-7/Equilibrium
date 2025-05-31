@@ -135,6 +135,7 @@ function HomeScreen({ navigation }: any) {
 
         const llamaContext = await initLlama({
           model: MODEL_PATH,
+          use_mlock: true,
           n_ctx: 4096,
           n_gpu_layers: 1
         });
@@ -213,13 +214,15 @@ function HomeScreen({ navigation }: any) {
   );
 }
 
-// Chat Screen Component
+// Replace your existing ChatScreen component with this fixed version
+
 function ChatScreen({ route }: any) {
   const [conversation, setConversation] = 
     useState<Message[]>(INITIAL_CONVERSATION);
   const [isGenerating, setIsGenerating] = useState(false);
   const [userInput, setUserInput] = useState<string>('');
   const scrollViewRef = useRef<ScrollView>(null);
+  const [tokensPerSecond, setTokensPerSecond] = useState<number[]>([]);
 
   const { llamaContext, isRAGReady, embeddingContext } = useModel();
 
@@ -241,9 +244,11 @@ function ChatScreen({ route }: any) {
       return;
     } 
 
+    // New user's message and placeholder for assistant's response
     const newConversation : Message[] = [
       ...conversation,
       {role: 'user', content: finalInput},
+      {role: "assistant", content: ""}
     ];
 
     // 1. Update UI state
@@ -260,6 +265,7 @@ function ChatScreen({ route }: any) {
     } catch (err) {
       console.error('❌ Embedding error:', err);
       Alert.alert('Embedding error', 'Could not create an embedding');
+      setIsGenerating(false);
       return;
     }
 
@@ -273,12 +279,11 @@ function ChatScreen({ route }: any) {
       console.log("RAG document results: ", ragResults);
     } catch (error) {
       console.error('❌ RAG Search Failed - Could not perform similarity search. Error: ', error);
+      setIsGenerating(false);
       return;
     }
 
     // 4. LLM completion
-    // Use the 'newConversation' not to wait for 'conversation' UI and state updates
-    console.log('Updated conversation: ', newConversation);
     try {
       const stopWords = [
         '</s>', '<|end|>', 'user:', 'assistant:',
@@ -287,7 +292,6 @@ function ChatScreen({ route }: any) {
       ];
 
       const ragTexts = ragResults.map((item:any, idx:any) => {
-        // Prefix with 'Document' and index
         return `Document ${idx + 1}:\n${item.content.trim()}`;
       }).join('\n\n');
 
@@ -295,46 +299,97 @@ function ChatScreen({ route }: any) {
       `Here are some relevant documents to consider before answering:\n\n${ragTexts}\n\n---\n\n` +
       PROMPT_TEMPLATE + `\n` + finalInput;
 
-      const lastMsgIndex = newConversation.length - 1;
       const messagesForLlama = [
-        // everything up to but not including the last message
-        ...newConversation.slice(0, lastMsgIndex),
-        // Replace last user message with the augmented version
+        ...conversation,  // The original conversation doesn't contain the new user message yet!
         { role: 'user', content: augmentedUserContent },
       ];
     
       console.log("Check if content's correctly passed to the Llama -->", messagesForLlama);
 
-      const result = await llamaContext.completion(
+      interface CompletionData {
+        token: string;
+      }
+
+      interface CompletionResult {
+        timings: {
+          predicted_per_second: number;
+        };
+      }
+
+      let currentAssistantMessage = "";
+
+      const result: CompletionResult = await llamaContext.completion(
         {
           messages: messagesForLlama,
           max_tokens: 300,
           stop: stopWords,
         },
-        (data: {token: any}) => {
-          // This is a partial completion callback for live streaming tokens
-          const {token} = data;
-        },
+        (data: CompletionData) => { 
+          const token = data.token;
+          currentAssistantMessage += token;
+
+          // Use functional state update to avoid stale closure issues
+          setConversation((prevConversation) => {
+            const updatedConversation = [...prevConversation];
+            const lastIndex = updatedConversation.length - 1;
+            
+            if (lastIndex >= 0 && updatedConversation[lastIndex].role === 'assistant') {
+              updatedConversation[lastIndex] = {
+                ...updatedConversation[lastIndex],
+                content: currentAssistantMessage.trim()
+              };
+            }
+            
+            return updatedConversation;
+          });
+
+          // Auto-scroll to bottom as new tokens arrive
+          setTimeout(() => {
+            scrollViewRef.current?.scrollToEnd({ animated: true });
+          }, 100);
+        }
       );
 
-      // Ensure the result has text before updating the conversation
-      if (result && result.text) {
-        setConversation(prev => [
-          ...prev,
-          {role: 'assistant', content: result.text.trim()},
-        ]);
-      } else {
-        throw new Error('No response from the model.');
-      }
+      // Add the final tokens per second measurement
+      setTokensPerSecond((prev) => [
+        ...prev,
+        parseFloat(result.timings.predicted_per_second.toFixed(2)),
+      ]);
 
     } catch (error) {
-      // Handle errors during inference
+      console.error('Inference error:', error);
       Alert.alert(
         'Inference error',
         error instanceof Error ? error.message : 'An unknown error occurred.',
       );
+      
+      // Remove the empty assistant message on error
+      setConversation((prev) => prev.slice(0, -1));
     } finally {
       setIsGenerating(false);
+    }
+  };
+
+  const stopGeneration = async () => {
+    try {
+      await llamaContext.stopCompletion();
+      setIsGenerating(false);
+
+      setConversation((prev) => {
+        const lastMessage = prev[prev.length - 1];
+        if (lastMessage.role === "assistant") {
+          return [
+            ...prev.slice(0, -1),
+            {
+              ...lastMessage,
+              content: lastMessage.content + "\n\n*Generation stopped by user*",
+            },
+          ];
+        }
+        return prev;
+      });
+    } catch (error) {
+      console.error("Error stopping completion:", error);
     }
   };
 
@@ -347,6 +402,13 @@ function ChatScreen({ route }: any) {
     sendInitialMessage();
   }, []);
 
+  // Auto-scroll when conversation updates
+  useEffect(() => {
+    setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+  }, [conversation]);
+
   return (
     <SafeAreaView style={styles.chatContainer}>
       <KeyboardAvoidingView
@@ -356,15 +418,26 @@ function ChatScreen({ route }: any) {
         <ScrollView
           ref={scrollViewRef}
           contentContainerStyle={styles.messagesContainer}
+          onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
         >
           {conversation.slice(1).map((msg, index) => (
             <View key={index} style={[
               styles.messageBubble,
               msg.role === 'user' ? styles.userBubble : styles.assistantBubble
             ]}>
-              <Text style={styles.messageText}>
-                {msg.content || (msg.role === 'assistant' ? 'Thinking...' : '')}
+              <Text style={[
+                styles.messageText,
+                msg.role === 'user' ? { color: '#FFFFFF' } : { color: '#1E293B' }
+              ]}>
+                {msg.content}
               </Text>
+              {msg.role === "assistant" && msg.content && (
+                <Text style={styles.tokenInfo}>
+                  {tokensPerSecond[Math.floor(index / 2)] ? 
+                    `${tokensPerSecond[Math.floor(index / 2)]} tokens/s` : 
+                    'Processing...'}
+                </Text>
+              )}
             </View>
           ))}
         </ScrollView>
@@ -375,23 +448,29 @@ function ChatScreen({ route }: any) {
             placeholderTextColor="#94A3B8"
             value={userInput}
             onChangeText={setUserInput}
+            editable={!isGenerating}
           />
           <View style={styles.buttonRow}>
-            <TouchableOpacity
-              style={styles.sendButton}
-              onPress={() => handleSendMessage()}
-              disabled={isGenerating}>
-              <Text style={styles.buttonText}>
-                {isGenerating ? '...' : 'Send'}
-              </Text>
-            </TouchableOpacity>
+            {isGenerating ? (
+              <TouchableOpacity
+                style={[styles.sendButton, { backgroundColor: '#EF4444' }]}
+                onPress={stopGeneration}>
+                <Text style={styles.buttonText}>Stop</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={styles.sendButton}
+                onPress={() => handleSendMessage()}
+                disabled={isGenerating}>
+                <Text style={styles.buttonText}>Send</Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
-
 
 const styles = StyleSheet.create({
   container: {
@@ -607,6 +686,12 @@ const styles = StyleSheet.create({
     color: '#D0DDF0',
     fontSize: 18,
   }, 
+  tokenInfo: {
+    fontSize: 12,
+    color: "#94A3B8",
+    marginTop: 4,
+    textAlign: "right",
+  },
 });
 
 const Stack = createNativeStackNavigator();
